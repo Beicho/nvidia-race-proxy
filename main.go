@@ -502,6 +502,15 @@ func (s *proxyServer) runAttempt(ctx context.Context, inbound *http.Request, bod
 	copyRequestHeaders(request.Header, inbound.Header)
 	request.Header.Set("Authorization", "Bearer "+key.secret)
 	request.Header.Set("Accept-Encoding", "identity")
+	// Request contexts are the primary cancellation mechanism. Explicitly invoke
+	// Transport.CancelRequest as well so a losing HTTP/1 connection blocked
+	// before response headers is torn down immediately.
+	if canceler, ok := s.client.Transport.(interface{ CancelRequest(*http.Request) }); ok {
+		stopExplicitCancel := context.AfterFunc(ctx, func() {
+			canceler.CancelRequest(request)
+		})
+		defer stopExplicitCancel()
+	}
 
 	response, err := s.client.Do(request)
 	if err != nil {
