@@ -229,3 +229,52 @@ func TestHTTPClientCancellationPrimitive(t *testing.T) {
 		t.Fatal("standard HTTP client did not return after cancellation")
 	}
 }
+
+func TestFirstValidByteTimeoutReleasesKeysWithoutCooldown(t *testing.T) {
+	keys := []string{"nvapi-timeout-a", "nvapi-timeout-b", "nvapi-timeout-c"}
+	var canceled atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		_ = r.Body.Close()
+		<-r.Context().Done()
+		canceled.Add(1)
+	}))
+	defer upstream.Close()
+	baseURL, _ := url.Parse(upstream.URL + "/v1")
+	proxy := &proxyServer{
+		cfg: config{
+			BaseURL:      baseURL,
+			Fanout:       3,
+			MaxWaves:     1,
+			MaxBodyBytes: defaultMaxBodyBytes,
+			MaxRespBytes: defaultMaxReplyBytes,
+			FirstByteTTL: 40 * time.Millisecond,
+		},
+		client:    upstream.Client(),
+		scheduler: newScheduler(keys),
+	}
+
+	request := httptest.NewRequest(http.MethodPost, "http://proxy/v1/chat/completions", strings.NewReader(`{"stream":true}`))
+	recorder := httptest.NewRecorder()
+	started := time.Now()
+	proxy.handleProxy(recorder, request)
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("first byte timeout took too long: %s", elapsed)
+	}
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d, want %d", recorder.Code, http.StatusBadGateway)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		snapshot := proxy.scheduler.snapshot()
+		if snapshot.InFlight == 0 && canceled.Load() == 3 {
+			if snapshot.Available != 3 || snapshot.Cooldown != 0 || snapshot.Disabled != 0 {
+				t.Fatalf("timeout must not penalize keys: %+v", snapshot)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out attempts did not settle: state=%+v canceled=%d", proxy.scheduler.snapshot(), canceled.Load())
+}

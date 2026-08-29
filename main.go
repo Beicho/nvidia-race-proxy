@@ -46,6 +46,7 @@ type config struct {
 	MaxBodyBytes int64
 	MaxRespBytes int64
 	HTTPTimeout  time.Duration
+	FirstByteTTL time.Duration
 }
 
 type keyState struct {
@@ -248,7 +249,7 @@ func main() {
 		_ = httpServer.Shutdown(ctx)
 	}()
 
-	log.Printf("nvidia race proxy listening on %s with %d keys, fanout=%d, waves=%d, socks5=%t", cfg.ListenAddr, len(keys), cfg.Fanout, cfg.MaxWaves, cfg.SOCKS5URL != "")
+	log.Printf("nvidia race proxy listening on %s with %d keys, fanout=%d, waves=%d, first_byte_timeout=%s, socks5=%t", cfg.ListenAddr, len(keys), cfg.Fanout, cfg.MaxWaves, cfg.FirstByteTTL, cfg.SOCKS5URL != "")
 	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("server error: %v", err)
 	}
@@ -287,6 +288,10 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return config{}, err
 	}
+	firstByteSeconds, err := envInt("FIRST_VALID_BYTE_TIMEOUT_SECONDS", 120, 1, 300)
+	if err != nil {
+		return config{}, err
+	}
 	return config{
 		ListenAddr:   envOr("LISTEN_ADDR", defaultListenAddr),
 		BaseURL:      baseURL,
@@ -297,6 +302,7 @@ func loadConfig() (config, error) {
 		MaxBodyBytes: maxBody,
 		MaxRespBytes: maxResp,
 		HTTPTimeout:  time.Duration(timeoutSeconds) * time.Second,
+		FirstByteTTL: time.Duration(firstByteSeconds) * time.Second,
 	}, nil
 }
 
@@ -439,7 +445,15 @@ func (s *proxyServer) handleProxy(w http.ResponseWriter, r *http.Request) {
 		for _, key := range picked {
 			attemptCtx, cancelAttempt := context.WithCancelCause(waveCtx)
 			activeAttempts = append(activeAttempts, activeAttempt{keyIndex: key.index, cancel: cancelAttempt})
-			go func(attemptCtx context.Context, key pickedKey) {
+			firstByteTTL := s.cfg.FirstByteTTL
+			if firstByteTTL <= 0 {
+				firstByteTTL = 120 * time.Second
+			}
+			firstByteTimer := time.AfterFunc(firstByteTTL, func() {
+				cancelAttempt(errors.New("first valid upstream byte timed out"))
+			})
+			go func(attemptCtx context.Context, key pickedKey, firstByteTimer *time.Timer) {
+				defer firstByteTimer.Stop()
 				defer s.scheduler.release(key.index)
 				result := s.runAttempt(attemptCtx, r, body, streaming, key)
 				if result.candidate != nil {
@@ -454,7 +468,7 @@ func (s *proxyServer) handleProxy(w http.ResponseWriter, r *http.Request) {
 				case failures <- result.failure:
 				case <-waveCtx.Done():
 				}
-			}(attemptCtx, key)
+			}(attemptCtx, key, firstByteTimer)
 		}
 
 		failed := 0
