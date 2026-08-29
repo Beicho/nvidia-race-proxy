@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -42,6 +43,8 @@ func TestFastestValidSSEWinsAndLosersStayHealthy(t *testing.T) {
 	seenKeys := sync.Map{}
 
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		_ = r.Body.Close()
 		key := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		seenKeys.Store(key, true)
 		if started.Add(1) == 3 {
@@ -117,18 +120,15 @@ func TestFastestValidSSEWinsAndLosersStayHealthy(t *testing.T) {
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
 		snapshot := proxy.scheduler.snapshot()
-		if snapshot.InFlight == 0 {
+		if snapshot.InFlight == 0 && canceled.Load() == 2 {
 			if snapshot.Available != 3 || snapshot.Cooldown != 0 || snapshot.Disabled != 0 {
 				t.Fatalf("losers must remain healthy after cancellation: %+v", snapshot)
-			}
-			if canceled.Load() != 2 {
-				t.Fatalf("canceled losers=%d, want 2", canceled.Load())
 			}
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatal("contender goroutines did not release their keys")
+	t.Fatalf("contenders did not settle: state=%+v canceled_losers=%d", proxy.scheduler.snapshot(), canceled.Load())
 }
 
 func TestWinnerCancellationDoesNotTruncateStream(t *testing.T) {
@@ -185,5 +185,47 @@ func TestCanceledAttemptDoesNotCooldownKey(t *testing.T) {
 	snapshot := s.snapshot()
 	if snapshot.Available != 3 || snapshot.Cooldown != 0 {
 		t.Fatalf("normal cancellation changed key health: %+v", snapshot)
+	}
+}
+
+func TestHTTPClientCancellationPrimitive(t *testing.T) {
+	started := make(chan struct{})
+	serverCanceled := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		select {
+		case <-r.Context().Done():
+			close(serverCanceled)
+		case <-time.After(time.Second):
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer upstream.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, upstream.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		response, _ := upstream.Client().Do(request)
+		if response != nil {
+			response.Body.Close()
+		}
+		close(done)
+	}()
+	<-started
+	cancel()
+
+	select {
+	case <-serverCanceled:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("standard HTTP request context did not cancel the upstream handler")
+	}
+	select {
+	case <-done:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("standard HTTP client did not return after cancellation")
 	}
 }

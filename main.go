@@ -201,6 +201,11 @@ type attemptResult struct {
 	failure   *upstreamFailure
 }
 
+type activeAttempt struct {
+	keyIndex int
+	cancel   context.CancelCauseFunc
+}
+
 func main() {
 	cfg, err := loadConfig()
 	if err != nil {
@@ -429,13 +434,12 @@ func (s *proxyServer) handleProxy(w http.ResponseWriter, r *http.Request) {
 		winner := make(chan *candidate, 1)
 		failures := make(chan *upstreamFailure, len(picked))
 		var claimed atomic.Bool
-		attemptCancels := make(map[int]context.CancelCauseFunc, len(picked))
+		activeAttempts := make([]activeAttempt, 0, len(picked))
 
 		for _, key := range picked {
-			key := key
 			attemptCtx, cancelAttempt := context.WithCancelCause(waveCtx)
-			attemptCancels[key.index] = cancelAttempt
-			go func() {
+			activeAttempts = append(activeAttempts, activeAttempt{keyIndex: key.index, cancel: cancelAttempt})
+			go func(attemptCtx context.Context, key pickedKey) {
 				defer s.scheduler.release(key.index)
 				result := s.runAttempt(attemptCtx, r, body, streaming, key)
 				if result.candidate != nil {
@@ -450,7 +454,7 @@ func (s *proxyServer) handleProxy(w http.ResponseWriter, r *http.Request) {
 				case failures <- result.failure:
 				case <-waveCtx.Done():
 				}
-			}()
+			}(attemptCtx, key)
 		}
 
 		failed := 0
@@ -460,13 +464,18 @@ func (s *proxyServer) handleProxy(w http.ResponseWriter, r *http.Request) {
 				cancelWave(r.Context().Err())
 				return
 			case selected := <-winner:
-				for index, cancelAttempt := range attemptCancels {
-					if index != selected.keyIndex {
-						cancelAttempt(errors.New("another contender won"))
+				for _, attempt := range activeAttempts {
+					if attempt.keyIndex != selected.keyIndex {
+						attempt.cancel(errors.New("another contender won"))
 					}
 				}
 				s.writeCandidate(w, selected)
-				attemptCancels[selected.keyIndex](errors.New("winner response completed"))
+				for _, attempt := range activeAttempts {
+					if attempt.keyIndex == selected.keyIndex {
+						attempt.cancel(errors.New("winner response completed"))
+						break
+					}
+				}
 				cancelWave(errors.New("wave completed"))
 				log.Printf("request=%d method=%s path=%s status=%d winner_slot=%d duration_ms=%d", requestID, r.Method, r.URL.Path, selected.status, selected.keyIndex, time.Since(started).Milliseconds())
 				return
