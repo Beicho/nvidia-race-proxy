@@ -103,7 +103,7 @@ func (s *scheduler) pick(n int, excluded map[int]struct{}) []pickedKey {
 			continue
 		}
 		state := &s.keys[idx]
-		if state.disabled || now.Before(state.cooldownUntil) {
+		if state.disabled || state.inFlight > 0 || now.Before(state.cooldownUntil) {
 			continue
 		}
 		state.inFlight++
@@ -160,6 +160,8 @@ func (s *scheduler) snapshot() healthSnapshot {
 			snapshot.Disabled++
 		case now.Before(state.cooldownUntil):
 			snapshot.Cooldown++
+		case state.inFlight > 0:
+			// Busy keys are reported by InFlight and are not currently pickable.
 		default:
 			snapshot.Available++
 		}
@@ -190,11 +192,26 @@ func (c *candidate) close() {
 }
 
 type upstreamFailure struct {
+	keyIndex int
 	status   int
 	header   http.Header
 	body     []byte
 	terminal bool
+	kind     string
+	cooldown time.Duration
+	disabled bool
 	err      error
+}
+
+type upstreamPayloadError struct {
+	status int
+}
+
+func (e *upstreamPayloadError) Error() string {
+	if e.status != 0 {
+		return fmt.Sprintf("upstream returned a structured error with status %d", e.status)
+	}
+	return "upstream returned a structured error payload"
 }
 
 type attemptResult struct {
@@ -422,6 +439,7 @@ func (s *proxyServer) handleProxy(w http.ResponseWriter, r *http.Request) {
 	streaming := requestWantsStream(body)
 	excluded := make(map[int]struct{})
 	var lastFailure *upstreamFailure
+	attempts := 0
 
 	for wave := 0; wave < s.cfg.MaxWaves; wave++ {
 		picked := s.scheduler.pick(s.cfg.Fanout, excluded)
@@ -435,6 +453,7 @@ func (s *proxyServer) handleProxy(w http.ResponseWriter, r *http.Request) {
 		for _, key := range picked {
 			excluded[key.index] = struct{}{}
 		}
+		attempts += len(picked)
 
 		waveCtx, cancelWave := context.WithCancelCause(r.Context())
 		winner := make(chan *candidate, 1)
@@ -496,11 +515,12 @@ func (s *proxyServer) handleProxy(w http.ResponseWriter, r *http.Request) {
 			case failure := <-failures:
 				failed++
 				if failure != nil {
+					log.Printf("request=%d wave=%d slot=%d status=%d failure_kind=%s cooldown_ms=%d disabled=%t terminal=%t duration_ms=%d", requestID, wave, failure.keyIndex, failure.status, failure.kind, failure.cooldown.Milliseconds(), failure.disabled, failure.terminal, time.Since(started).Milliseconds())
 					lastFailure = failure
 					if failure.terminal {
 						cancelWave(errors.New("terminal upstream response"))
 						s.writeFailure(w, failure)
-						log.Printf("request=%d method=%s path=%s status=%d terminal=true duration_ms=%d", requestID, r.Method, r.URL.Path, failure.status, time.Since(started).Milliseconds())
+						log.Printf("request=%d status=%d terminal=true slot=%d attempts=%d duration_ms=%d", requestID, failure.status, failure.keyIndex, attempts, time.Since(started).Milliseconds())
 						return
 					}
 				}
@@ -511,16 +531,18 @@ func (s *proxyServer) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 	if lastFailure != nil && lastFailure.status != 0 {
 		s.writeFailure(w, lastFailure)
+		log.Printf("request=%d status=%d exhausted=true attempts=%d duration_ms=%d", requestID, lastFailure.status, attempts, time.Since(started).Milliseconds())
 		return
 	}
 	writeJSONError(w, http.StatusBadGateway, "all NVIDIA contenders failed")
+	log.Printf("request=%d status=%d exhausted=true attempts=%d duration_ms=%d", requestID, http.StatusBadGateway, attempts, time.Since(started).Milliseconds())
 }
 
 func (s *proxyServer) runAttempt(ctx context.Context, inbound *http.Request, body []byte, streaming bool, key pickedKey) attemptResult {
 	target := joinUpstreamURL(s.cfg.BaseURL, inbound.URL)
 	request, err := http.NewRequestWithContext(ctx, inbound.Method, target, bytes.NewReader(body))
 	if err != nil {
-		return attemptResult{failure: &upstreamFailure{err: err}}
+		return attemptResult{failure: &upstreamFailure{keyIndex: key.index, kind: "request_build", err: err}}
 	}
 	copyRequestHeaders(request.Header, inbound.Header)
 	request.Header.Set("Authorization", "Bearer "+key.secret)
@@ -537,33 +559,24 @@ func (s *proxyServer) runAttempt(ctx context.Context, inbound *http.Request, bod
 
 	response, err := s.client.Do(request)
 	if err != nil {
+		failure := &upstreamFailure{keyIndex: key.index, kind: "transport", err: err}
 		if ctx.Err() == nil {
-			s.scheduler.cooldown(key.index, 5*time.Second)
+			failure.cooldown = 5 * time.Second
+			s.scheduler.cooldown(key.index, failure.cooldown)
 		}
-		return attemptResult{failure: &upstreamFailure{err: err}}
+		return attemptResult{failure: failure}
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		defer response.Body.Close()
 		failureBody, _ := io.ReadAll(io.LimitReader(response.Body, maxErrorBodyBytes))
 		failure := &upstreamFailure{
-			status: response.StatusCode,
-			header: response.Header.Clone(),
-			body:   failureBody,
+			keyIndex: key.index,
+			status:   response.StatusCode,
+			header:   response.Header.Clone(),
+			body:     failureBody,
+			kind:     "http_status",
 		}
-		switch response.StatusCode {
-		case http.StatusUnauthorized:
-			s.scheduler.disable(key.index)
-		case http.StatusForbidden:
-			s.scheduler.cooldown(key.index, 10*time.Minute)
-		case http.StatusTooManyRequests:
-			s.scheduler.cooldown(key.index, retryAfter(response.Header, time.Minute))
-		case http.StatusBadRequest, http.StatusNotFound, http.StatusUnprocessableEntity:
-			failure.terminal = true
-		default:
-			if response.StatusCode >= 500 {
-				s.scheduler.cooldown(key.index, 10*time.Second)
-			}
-		}
+		s.applyFailurePolicy(failure)
 		return attemptResult{failure: failure}
 	}
 
@@ -571,10 +584,23 @@ func (s *proxyServer) runAttempt(ctx context.Context, inbound *http.Request, bod
 		prefix, reader, err := readValidSSEPrefix(response.Body)
 		if err != nil {
 			_ = response.Body.Close()
-			if ctx.Err() == nil {
-				s.scheduler.cooldown(key.index, 5*time.Second)
+			failure := &upstreamFailure{
+				keyIndex: key.index,
+				header:   response.Header.Clone(),
+				body:     prefix,
+				kind:     "sse_validation",
+				err:      err,
 			}
-			return attemptResult{failure: &upstreamFailure{err: err}}
+			var payloadErr *upstreamPayloadError
+			if errors.As(err, &payloadErr) {
+				failure.status = payloadErr.status
+				failure.kind = "sse_error_payload"
+				s.applyFailurePolicy(failure)
+			} else if ctx.Err() == nil {
+				failure.cooldown = 5 * time.Second
+				s.scheduler.cooldown(key.index, failure.cooldown)
+			}
+			return attemptResult{failure: failure}
 		}
 		return attemptResult{candidate: &candidate{
 			keyIndex: key.index,
@@ -588,13 +614,26 @@ func (s *proxyServer) runAttempt(ctx context.Context, inbound *http.Request, bod
 	reply, err := io.ReadAll(io.LimitReader(response.Body, s.cfg.MaxRespBytes+1))
 	_ = response.Body.Close()
 	if err != nil {
-		return attemptResult{failure: &upstreamFailure{err: err}}
+		return attemptResult{failure: &upstreamFailure{keyIndex: key.index, kind: "response_read", err: err}}
 	}
 	if int64(len(reply)) > s.cfg.MaxRespBytes {
-		return attemptResult{failure: &upstreamFailure{err: errors.New("upstream response exceeds configured limit")}}
+		return attemptResult{failure: &upstreamFailure{keyIndex: key.index, kind: "response_too_large", err: errors.New("upstream response exceeds configured limit")}}
 	}
 	if err := validateJSONReply(reply); err != nil {
-		return attemptResult{failure: &upstreamFailure{err: err}}
+		failure := &upstreamFailure{
+			keyIndex: key.index,
+			header:   response.Header.Clone(),
+			body:     reply,
+			kind:     "json_validation",
+			err:      err,
+		}
+		var payloadErr *upstreamPayloadError
+		if errors.As(err, &payloadErr) {
+			failure.status = payloadErr.status
+			failure.kind = "json_error_payload"
+			s.applyFailurePolicy(failure)
+		}
+		return attemptResult{failure: failure}
 	}
 	return attemptResult{candidate: &candidate{
 		keyIndex: key.index,
@@ -607,20 +646,28 @@ func (s *proxyServer) runAttempt(ctx context.Context, inbound *http.Request, bod
 func readValidSSEPrefix(body io.Reader) ([]byte, *bufio.Reader, error) {
 	reader := bufio.NewReader(body)
 	prefix := make([]byte, 0, 4096)
+	errorEvent := false
 	for len(prefix) < maxSSEPrefixBytes {
 		line, err := reader.ReadBytes('\n')
 		prefix = append(prefix, line...)
 		trimmed := bytes.TrimSpace(line)
-		if len(trimmed) > 0 && !bytes.HasPrefix(trimmed, []byte(":")) {
-			payload := trimmed
-			if bytes.HasPrefix(payload, []byte("data:")) {
-				payload = bytes.TrimSpace(bytes.TrimPrefix(payload, []byte("data:")))
-			}
+		switch {
+		case len(trimmed) == 0:
+			errorEvent = false
+		case bytes.HasPrefix(trimmed, []byte(":")):
+		case bytes.HasPrefix(trimmed, []byte("event:")):
+			eventName := strings.TrimSpace(string(bytes.TrimPrefix(trimmed, []byte("event:"))))
+			errorEvent = strings.EqualFold(eventName, "error")
+		case bytes.HasPrefix(trimmed, []byte("data:")):
+			payload := bytes.TrimSpace(bytes.TrimPrefix(trimmed, []byte("data:")))
 			if len(payload) > 0 && !bytes.Equal(payload, []byte("[DONE]")) {
+				if payloadErr, exists := structuredPayloadError(payload, true); exists {
+					return prefix, nil, payloadErr
+				}
 				var decoded map[string]json.RawMessage
 				if json.Unmarshal(payload, &decoded) == nil {
-					if raw, exists := decoded["error"]; exists && len(bytes.TrimSpace(raw)) > 0 && !bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
-						return nil, nil, errors.New("upstream SSE returned an error payload")
+					if errorEvent {
+						return prefix, nil, &upstreamPayloadError{}
 					}
 					return prefix, reader, nil
 				}
@@ -644,10 +691,100 @@ func validateJSONReply(reply []byte) error {
 	if err := json.Unmarshal(reply, &decoded); err != nil {
 		return fmt.Errorf("invalid upstream JSON: %w", err)
 	}
-	if raw, exists := decoded["error"]; exists && len(bytes.TrimSpace(raw)) > 0 && !bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
-		return errors.New("upstream returned an error payload")
+	if payloadErr, exists := structuredPayloadErrorFromObject(decoded, true); exists {
+		return payloadErr
 	}
 	return nil
+}
+
+func structuredPayloadError(payload []byte, allowTopLevelStatus bool) (*upstreamPayloadError, bool) {
+	var decoded map[string]json.RawMessage
+	if json.Unmarshal(payload, &decoded) != nil {
+		return nil, false
+	}
+	return structuredPayloadErrorFromObject(decoded, allowTopLevelStatus)
+}
+
+func structuredPayloadErrorFromObject(decoded map[string]json.RawMessage, allowTopLevelStatus bool) (*upstreamPayloadError, bool) {
+	if raw, exists := decoded["error"]; exists && len(bytes.TrimSpace(raw)) > 0 && !bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return &upstreamPayloadError{status: structuredStatus(raw)}, true
+	}
+	if allowTopLevelStatus {
+		if status := structuredStatusFields(decoded); status >= 400 {
+			return &upstreamPayloadError{status: status}, true
+		}
+	}
+	return nil, false
+}
+
+func structuredStatus(raw json.RawMessage) int {
+	var decoded map[string]json.RawMessage
+	if json.Unmarshal(raw, &decoded) != nil {
+		return 0
+	}
+	return structuredStatusFields(decoded)
+}
+
+func structuredStatusFields(decoded map[string]json.RawMessage) int {
+	for _, field := range []string{"status", "status_code", "code"} {
+		if status := structuredStatusValue(decoded[field]); status != 0 {
+			return status
+		}
+	}
+	for _, field := range []string{"status", "code", "type"} {
+		var value string
+		if json.Unmarshal(decoded[field], &value) != nil {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case "too_many_requests", "rate_limit_exceeded", "rate_limited", "resource_exhausted":
+			return http.StatusTooManyRequests
+		}
+	}
+	return 0
+}
+
+func structuredStatusValue(raw json.RawMessage) int {
+	trimmed := strings.TrimSpace(string(raw))
+	if len(trimmed) >= 2 && trimmed[0] == '"' && trimmed[len(trimmed)-1] == '"' {
+		var value string
+		if json.Unmarshal(raw, &value) != nil {
+			return 0
+		}
+		trimmed = strings.TrimSpace(value)
+	}
+	status, err := strconv.Atoi(trimmed)
+	if err != nil || status < 400 || status > 599 {
+		return 0
+	}
+	return status
+}
+
+func (s *proxyServer) applyFailurePolicy(failure *upstreamFailure) {
+	if failure == nil {
+		return
+	}
+	switch failure.status {
+	case http.StatusUnauthorized:
+		failure.disabled = true
+		s.scheduler.disable(failure.keyIndex)
+	case http.StatusForbidden:
+		failure.cooldown = 10 * time.Minute
+		s.scheduler.cooldown(failure.keyIndex, failure.cooldown)
+	case http.StatusTooManyRequests:
+		failure.cooldown = retryAfter(failure.header, time.Minute)
+		if failure.cooldown < time.Minute {
+			failure.cooldown = time.Minute
+		}
+		s.scheduler.cooldown(failure.keyIndex, failure.cooldown)
+	case http.StatusBadRequest, http.StatusNotFound, http.StatusUnprocessableEntity:
+		failure.terminal = true
+	default:
+		if failure.status >= 500 {
+			failure.cooldown = 10 * time.Second
+			s.scheduler.cooldown(failure.keyIndex, failure.cooldown)
+		}
+	}
 }
 
 func (s *proxyServer) writeCandidate(w http.ResponseWriter, selected *candidate) {

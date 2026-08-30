@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -34,7 +36,37 @@ func TestSchedulerPicksDistinctKeys(t *testing.T) {
 	}
 }
 
-func TestFastestValidSSEWinsAndLosersStayHealthy(t *testing.T) {
+func TestSchedulerPickSkipsKeysAlreadyInFlight(t *testing.T) {
+	s := newScheduler([]string{"nvapi-one", "nvapi-two", "nvapi-three"})
+	first := s.pick(1, nil)
+	if len(first) != 1 || first[0].index != 0 {
+		t.Fatalf("first pick=%v, want slot 0", first)
+	}
+
+	// Force the next scan to begin at the occupied slot. An in-flight key must
+	// not be handed to another request even when it is otherwise healthy.
+	s.mu.Lock()
+	s.cursor = first[0].index
+	s.mu.Unlock()
+	second := s.pick(3, nil)
+	defer func() {
+		s.release(first[0].index)
+		for _, key := range second {
+			s.release(key.index)
+		}
+	}()
+
+	if len(second) != 2 {
+		t.Fatalf("second pick returned %d keys, want the 2 idle keys", len(second))
+	}
+	for _, key := range second {
+		if key.index == first[0].index {
+			t.Fatalf("second pick reused in-flight slot %d", key.index)
+		}
+	}
+}
+
+func TestThreeWayRaceFastestValidSSEWinsAndLosersStayHealthy(t *testing.T) {
 	keys := []string{"nvapi-slow-a", "nvapi-fast", "nvapi-slow-b"}
 	var started atomic.Int32
 	ready := make(chan struct{})
@@ -129,6 +161,115 @@ func TestFastestValidSSEWinsAndLosersStayHealthy(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("contenders did not settle: state=%+v canceled_losers=%d", proxy.scheduler.snapshot(), canceled.Load())
+}
+
+func TestSSEErrorStatusVariantsReturn429AndCooldownForOneMinute(t *testing.T) {
+	tests := []struct {
+		name         string
+		errorPayload string
+	}{
+		{name: "status number", errorPayload: `{"status":429,"message":"raw-status-marker"}`},
+		{name: "status_code string", errorPayload: `{"status_code":"429","message":"raw-status-code-marker"}`},
+		{name: "code number", errorPayload: `{"code":429,"message":"raw-code-marker"}`},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = fmt.Fprintf(w, "data: {\"error\":%s}\n\n", test.errorPayload)
+			}))
+			defer upstream.Close()
+
+			proxy := newTestProxy(t, upstream, []string{"fake-sse-key"}, 1, 1)
+			started := time.Now()
+			recorder := exerciseProxy(proxy, `{"model":"test","stream":true}`)
+			if recorder.Code != http.StatusTooManyRequests {
+				t.Fatalf("status=%d body=%s, want 429", recorder.Code, recorder.Body.String())
+			}
+			assertCooldownNear(t, proxy.scheduler, 0, started.Add(time.Minute), time.Second)
+		})
+	}
+}
+
+func TestHTTPAndSSE429UseTheSameOneMinutePolicy(t *testing.T) {
+	httpUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// A shorter upstream hint must not weaken the proxy's one-minute policy.
+		w.Header().Set("Retry-After", "1")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"error":{"message":"raw-http-429-marker"}}`)
+	}))
+	defer httpUpstream.Close()
+	httpProxy := newTestProxy(t, httpUpstream, []string{"fake-http-key"}, 1, 1)
+	httpStarted := time.Now()
+	httpRecorder := exerciseProxy(httpProxy, `{"model":"test","stream":false}`)
+
+	longRetryUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "120")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer longRetryUpstream.Close()
+	longRetryProxy := newTestProxy(t, longRetryUpstream, []string{"fake-long-retry-key"}, 1, 1)
+	longRetryStarted := time.Now()
+	longRetryRecorder := exerciseProxy(longRetryProxy, `{"model":"test","stream":false}`)
+
+	sseUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"error\":{\"status\":429,\"message\":\"raw-sse-429-marker\"}}\n\n")
+	}))
+	defer sseUpstream.Close()
+	sseProxy := newTestProxy(t, sseUpstream, []string{"fake-sse-key"}, 1, 1)
+	sseStarted := time.Now()
+	sseRecorder := exerciseProxy(sseProxy, `{"model":"test","stream":true}`)
+
+	if httpRecorder.Code != http.StatusTooManyRequests || longRetryRecorder.Code != http.StatusTooManyRequests || sseRecorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("short HTTP status=%d, long HTTP status=%d, SSE status=%d; want all 429", httpRecorder.Code, longRetryRecorder.Code, sseRecorder.Code)
+	}
+	assertCooldownNear(t, httpProxy.scheduler, 0, httpStarted.Add(time.Minute), time.Second)
+	assertCooldownNear(t, longRetryProxy.scheduler, 0, longRetryStarted.Add(2*time.Minute), time.Second)
+	assertCooldownNear(t, sseProxy.scheduler, 0, sseStarted.Add(time.Minute), time.Second)
+}
+
+func TestFailureLogsDoNotLeakKeyOrRawUpstreamBody(t *testing.T) {
+	const (
+		fakeKey       = "nvapi-super-secret-test-key"
+		fakeBodyToken = "raw-upstream-body-should-not-appear"
+	)
+	fakeKeys := []string{fakeKey, "fake-key-two", "fake-key-three"}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = fmt.Fprintf(w, `{"error":{"message":%q}}`, fakeBodyToken)
+	}))
+	defer upstream.Close()
+
+	var logs bytes.Buffer
+	originalWriter := log.Writer()
+	originalFlags := log.Flags()
+	originalPrefix := log.Prefix()
+	log.SetOutput(&logs)
+	log.SetFlags(0)
+	log.SetPrefix("")
+	defer func() {
+		log.SetOutput(originalWriter)
+		log.SetFlags(originalFlags)
+		log.SetPrefix(originalPrefix)
+	}()
+
+	proxy := newTestProxy(t, upstream, fakeKeys, 3, 1)
+	recorder := exerciseProxy(proxy, `{"model":"test","stream":false}`)
+	if recorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("status=%d body=%s, want 429", recorder.Code, recorder.Body.String())
+	}
+
+	logged := logs.String()
+	if !strings.Contains(logged, "status=429") || !strings.Contains(logged, "slot=") {
+		t.Fatalf("failure log lacks safe status/slot metadata: %q", logged)
+	}
+	for _, secret := range append(fakeKeys, fakeBodyToken) {
+		if strings.Contains(logged, secret) {
+			t.Fatalf("failure log leaked sensitive marker %q: %q", secret, logged)
+		}
+	}
 }
 
 func TestWinnerCancellationDoesNotTruncateStream(t *testing.T) {
@@ -277,4 +418,44 @@ func TestFirstValidByteTimeoutReleasesKeysWithoutCooldown(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("timed out attempts did not settle: state=%+v canceled=%d", proxy.scheduler.snapshot(), canceled.Load())
+}
+
+func newTestProxy(t *testing.T, upstream *httptest.Server, keys []string, fanout, maxWaves int) *proxyServer {
+	t.Helper()
+	baseURL, err := url.Parse(upstream.URL + "/v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &proxyServer{
+		cfg: config{
+			BaseURL:      baseURL,
+			Fanout:       fanout,
+			MaxWaves:     maxWaves,
+			MaxBodyBytes: defaultMaxBodyBytes,
+			MaxRespBytes: defaultMaxReplyBytes,
+		},
+		client:    upstream.Client(),
+		scheduler: newScheduler(keys),
+	}
+}
+
+func exerciseProxy(proxy *proxyServer, body string) *httptest.ResponseRecorder {
+	request := httptest.NewRequest(http.MethodPost, "http://proxy/v1/chat/completions", strings.NewReader(body))
+	recorder := httptest.NewRecorder()
+	proxy.handleProxy(recorder, request)
+	return recorder
+}
+
+func assertCooldownNear(t *testing.T, scheduler *scheduler, index int, want time.Time, tolerance time.Duration) {
+	t.Helper()
+	scheduler.mu.Lock()
+	defer scheduler.mu.Unlock()
+	if index < 0 || index >= len(scheduler.keys) {
+		t.Fatalf("slot index %d is out of range", index)
+	}
+	got := scheduler.keys[index].cooldownUntil
+	delta := got.Sub(want)
+	if delta < -tolerance || delta > tolerance {
+		t.Fatalf("slot %d cooldownUntil=%s, want %s ± %s (delta %s)", index, got, want, tolerance, delta)
+	}
 }
