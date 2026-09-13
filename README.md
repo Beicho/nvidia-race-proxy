@@ -11,7 +11,11 @@ A small OpenAI-compatible reverse proxy for the NVIDIA API. For each incoming re
 ## Features
 
 - Three-key racing with configurable fan-out and waves.
-- The first valid SSE event or JSON response wins.
+- The first meaningful chat SSE event or valid JSON response wins.
+- Streaming winners keep their key reserved until the response closes; each forwarded chunk is flushed.
+- Chat races accept content, reasoning, tool/function output or a finish reason, ignoring role-only events.
+- SIGHUP reloads the key file without interrupting streams and preserves existing key health.
+- Internal `/metrics` JSON endpoint with bounded per-model latency histograms and counters.
 - Losing requests are cancelled without cooling down or penalizing their keys.
 - Real upstream failures update key health: 401 disables, 403/429/5xx and network failures apply bounded cooldowns.
 - Optional SOCKS5/SOCKS5H upstream proxy.
@@ -68,6 +72,16 @@ The client `Authorization` header is ignored and replaced with the selected NVID
 | `MAX_REQUEST_BODY_BYTES` | 16 MiB | Maximum incoming request body |
 | `MAX_RESPONSE_BODY_BYTES` | 64 MiB | Maximum buffered non-stream response |
 
+## Key Reload and Metrics
+
+Replace the key file atomically and send `SIGHUP` to the proxy process (`docker kill --signal=HUP nvidia-race-proxy` for Docker). Invalid files leave the current pool intact. Retained keys preserve their cooldown, disabled state and active reservations; removed keys finish current requests but are excluded from new picks. Reload does not restore a disabled key. Health reports only active pool membership in `total_keys`, with removed busy keys counted separately in `draining_keys` and included in `in_flight`.
+
+For Docker, mount a dedicated directory, such as `/opt/nvidia-race-proxy/secrets:/run/secrets:ro`, and set `NVIDIA_KEYS_FILE=/run/secrets/nvidia.keys`. A single-file bind mount can keep pointing at the old inode after an atomic replacement. Keep the directory restricted to the service owner/group and the key file mode `0600`. Never put credentials inside the source checkout.
+
+`GET /metrics` returns aggregate JSON for internal monitoring. It includes cumulative latency buckets (seconds), counts and sums for streaming first meaningful output, total request duration and loser cancellation delay, plus per-model request outcomes, active requests, upstream failures and 429 counts. First-output latency is measured when the proxy selects the winner, not when the end user receives it; non-streaming requests contribute only total latency. `active_streaming_requests` includes contenders waiting for output. At most 64 model labels plus `_other` are retained. Counters and histograms reset on restart, while key reload leaves them intact. No keys or request/response bodies are exposed. Keep health and metrics on the private service network.
+
+Shutdown drains active HTTP requests for up to `UPSTREAM_TIMEOUT_SECONDS`; set the container stop timeout accordingly. Reload is preferred for key-only updates.
+
 ## API compatibility
 
 Paths under `/v1/` are passed to the configured upstream. NVIDIA supports `/v1/chat/completions`, but currently returns 404 for `/v1/responses`; this proxy does not translate between the Responses and Chat Completions schemas.
@@ -101,6 +115,10 @@ MIT
 - 支持可选的 SOCKS5/SOCKS5H 上游代理。
 - 透明转发 OpenAI 兼容的流式和非流式请求。
 - 健康检查只返回汇总数量，绝不返回 Key。
+- 流式胜者在响应关闭前持续占用 Key，每个数据块写出后刷新。
+- 聊天竞速忽略仅包含角色或空内容的事件，等待正文、思考内容、工具调用或结束原因。
+- 支持 SIGHUP 热加载密钥，保留已有 Key 的冷却、禁用和占用状态，不中断当前请求。
+- 内网 `/metrics` 返回按模型统计的延迟直方图、请求结果、429 与取消耗时。
 - GitHub Releases 提供静态 Linux amd64 二进制。
 
 > [!IMPORTANT]
@@ -151,6 +169,12 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 | `UPSTREAM_SOCKS5` | 空 | 可选的 `socks5://` 或 `socks5h://` 代理地址 |
 | `MAX_REQUEST_BODY_BYTES` | 16 MiB | 用户请求体大小上限 |
 | `MAX_RESPONSE_BODY_BYTES` | 64 MiB | 非流式响应的最大缓冲大小 |
+
+### 密钥热加载与统计
+
+原子替换密钥文件后执行 `docker kill --signal=HUP nvidia-race-proxy`。无效文件不会改变当前池；移除的 Key 会完成当前请求后退出调度。Docker 应只读挂载专用密钥目录，避免单文件挂载在原子替换后仍指向旧文件。真实密钥不得放入源码仓库。
+
+`/metrics` 仅供内网使用，最多保留 64 个模型及一个汇总标签。首输出延迟只统计流式胜者产生有效输出的时间，不等于客户端收字时间；总耗时统计所有请求。指标在重启后清零，热加载不会清零。收到停止信号后服务会等待请求结束，最长为 `UPSTREAM_TIMEOUT_SECONDS`，Docker 停止超时应与之匹配。
 
 ### API 兼容性
 

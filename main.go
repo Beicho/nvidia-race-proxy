@@ -52,6 +52,7 @@ type config struct {
 type keyState struct {
 	secret        string
 	disabled      bool
+	retired       bool
 	cooldownUntil time.Time
 	inFlight      int
 }
@@ -73,6 +74,7 @@ type healthSnapshot struct {
 	Cooldown  int `json:"cooldown_keys"`
 	Disabled  int `json:"disabled_keys"`
 	InFlight  int `json:"in_flight"`
+	Draining  int `json:"draining_keys"`
 }
 
 func newScheduler(keys []string) *scheduler {
@@ -103,7 +105,7 @@ func (s *scheduler) pick(n int, excluded map[int]struct{}) []pickedKey {
 			continue
 		}
 		state := &s.keys[idx]
-		if state.disabled || state.inFlight > 0 || now.Before(state.cooldownUntil) {
+		if state.retired || state.disabled || state.inFlight > 0 || now.Before(state.cooldownUntil) {
 			continue
 		}
 		state.inFlight++
@@ -151,10 +153,17 @@ func (s *scheduler) snapshot() healthSnapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now()
-	snapshot := healthSnapshot{Total: len(s.keys)}
+	snapshot := healthSnapshot{}
 	for i := range s.keys {
 		state := &s.keys[i]
 		snapshot.InFlight += state.inFlight
+		if state.retired {
+			if state.inFlight > 0 {
+				snapshot.Draining++
+			}
+			continue
+		}
+		snapshot.Total++
 		switch {
 		case state.disabled:
 			snapshot.Disabled++
@@ -174,20 +183,30 @@ type proxyServer struct {
 	client    *http.Client
 	scheduler *scheduler
 	requestID atomic.Uint64
+	metrics   metricRegistry
 }
 
 type candidate struct {
-	keyIndex int
-	status   int
-	header   http.Header
-	reader   io.Reader
-	body     io.Closer
-	buffered []byte
+	keyIndex  int
+	status    int
+	header    http.Header
+	reader    io.Reader
+	body      io.Closer
+	buffered  []byte
+	closeOnce sync.Once
+	onClose   func()
 }
 
 func (c *candidate) close() {
-	if c != nil && c.body != nil {
-		_ = c.body.Close()
+	if c != nil {
+		c.closeOnce.Do(func() {
+			if c.body != nil {
+				_ = c.body.Close()
+			}
+			if c.onClose != nil {
+				c.onClose()
+			}
+		})
 	}
 }
 
@@ -224,6 +243,8 @@ type activeAttempt struct {
 	cancel   context.CancelCauseFunc
 }
 
+var errLostRace = errors.New("another contender won")
+
 func main() {
 	cfg, err := loadConfig()
 	if err != nil {
@@ -232,6 +253,9 @@ func main() {
 	keys, err := loadKeys(cfg.KeysFile)
 	if err != nil {
 		log.Fatalf("key file error: %v", err)
+	}
+	if len(keys) < cfg.Fanout {
+		log.Fatal("key pool is smaller than configured fanout")
 	}
 	transport, err := buildTransport(cfg.SOCKS5URL)
 	if err != nil {
@@ -248,6 +272,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", server.handleHealth)
+	mux.HandleFunc("/metrics", server.handleMetrics)
 	mux.HandleFunc("/", server.handleProxy)
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddr,
@@ -259,17 +284,39 @@ func main() {
 
 	shutdownCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	reloadSignals := make(chan os.Signal, 1)
+	signal.Notify(reloadSignals, syscall.SIGHUP)
+	defer signal.Stop(reloadSignals)
 	go func() {
+		for {
+			select {
+			case <-shutdownCtx.Done():
+				return
+			case <-reloadSignals:
+				if err := server.reloadKeys(); err != nil {
+					log.Print("key_reload success=false reason=invalid_key_file")
+				} else {
+					log.Printf("key_reload success=true total_keys=%d", server.scheduler.snapshot().Total)
+				}
+			}
+		}
+	}()
+	shutdownDone := make(chan struct{})
+	go func() {
+		defer close(shutdownDone)
 		<-shutdownCtx.Done()
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), cfg.HTTPTimeout)
 		defer cancel()
-		_ = httpServer.Shutdown(ctx)
+		if err := httpServer.Shutdown(ctx); err != nil {
+			_ = httpServer.Close()
+		}
 	}()
 
 	log.Printf("nvidia race proxy listening on %s with %d keys, fanout=%d, waves=%d, first_byte_timeout=%s, socks5=%t", cfg.ListenAddr, len(keys), cfg.Fanout, cfg.MaxWaves, cfg.FirstByteTTL, cfg.SOCKS5URL != "")
 	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("server error: %v", err)
 	}
+	<-shutdownDone
 }
 
 func loadConfig() (config, error) {
@@ -437,6 +484,10 @@ func (s *proxyServer) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	streaming := requestWantsStream(body)
+	model := metricModel(body)
+	s.metrics.start(model, streaming)
+	outcome := "failed"
+	defer func() { s.metrics.finish(model, streaming, outcome, time.Since(started)) }()
 	excluded := make(map[int]struct{})
 	var lastFailure *upstreamFailure
 	attempts := 0
@@ -447,7 +498,7 @@ func (s *proxyServer) handleProxy(w http.ResponseWriter, r *http.Request) {
 			for _, key := range picked {
 				s.scheduler.release(key.index)
 			}
-			writeJSONError(w, http.StatusServiceUnavailable, "fewer than three NVIDIA keys are currently available")
+			writeJSONError(w, http.StatusServiceUnavailable, "fewer NVIDIA keys are available than the configured fanout")
 			return
 		}
 		for _, key := range picked {
@@ -456,14 +507,17 @@ func (s *proxyServer) handleProxy(w http.ResponseWriter, r *http.Request) {
 		attempts += len(picked)
 
 		waveCtx, cancelWave := context.WithCancelCause(r.Context())
-		winner := make(chan *candidate, 1)
+		winner := make(chan *candidate)
 		failures := make(chan *upstreamFailure, len(picked))
-		var claimed atomic.Bool
 		activeAttempts := make([]activeAttempt, 0, len(picked))
 
 		for _, key := range picked {
 			attemptCtx, cancelAttempt := context.WithCancelCause(waveCtx)
-			activeAttempts = append(activeAttempts, activeAttempt{keyIndex: key.index, cancel: cancelAttempt})
+			var canceledAt atomic.Int64
+			activeAttempts = append(activeAttempts, activeAttempt{keyIndex: key.index, cancel: func(cause error) {
+				canceledAt.CompareAndSwap(0, time.Now().UnixNano())
+				cancelAttempt(cause)
+			}})
 			firstByteTTL := s.cfg.FirstByteTTL
 			if firstByteTTL <= 0 {
 				firstByteTTL = 120 * time.Second
@@ -473,15 +527,29 @@ func (s *proxyServer) handleProxy(w http.ResponseWriter, r *http.Request) {
 			})
 			go func(attemptCtx context.Context, key pickedKey, firstByteTimer *time.Timer) {
 				defer firstByteTimer.Stop()
-				defer s.scheduler.release(key.index)
+				defer func() {
+					if errors.Is(context.Cause(attemptCtx), errLostRace) {
+						s.metrics.loserCanceled(model, time.Since(time.Unix(0, canceledAt.Load())))
+					}
+				}()
 				result := s.runAttempt(attemptCtx, r, body, streaming, key)
+				firstByteTimer.Stop()
 				if result.candidate != nil {
-					if claimed.CompareAndSwap(false, true) {
-						winner <- result.candidate
-					} else {
+					result.candidate.onClose = func() { s.scheduler.release(key.index) }
+					select {
+					case winner <- result.candidate:
+					case <-attemptCtx.Done():
 						result.candidate.close()
+						select {
+						case failures <- &upstreamFailure{keyIndex: key.index, kind: "canceled_handoff", err: attemptCtx.Err()}:
+						case <-waveCtx.Done():
+						}
 					}
 					return
+				}
+				s.scheduler.release(key.index)
+				if result.failure != nil && attemptCtx.Err() == nil {
+					s.metrics.upstreamFailure(model, result.failure.status)
 				}
 				select {
 				case failures <- result.failure:
@@ -494,15 +562,25 @@ func (s *proxyServer) handleProxy(w http.ResponseWriter, r *http.Request) {
 		for failed < len(picked) {
 			select {
 			case <-r.Context().Done():
+				outcome = "canceled"
 				cancelWave(r.Context().Err())
 				return
 			case selected := <-winner:
+				if streaming {
+					s.metrics.firstOutput(model, time.Since(started))
+				}
 				for _, attempt := range activeAttempts {
 					if attempt.keyIndex != selected.keyIndex {
-						attempt.cancel(errors.New("another contender won"))
+						attempt.cancel(errLostRace)
 					}
 				}
-				s.writeCandidate(w, selected)
+				transferErr := s.writeCandidate(w, selected)
+				outcome = "completed"
+				if r.Context().Err() != nil {
+					outcome = "canceled"
+				} else if transferErr != nil {
+					outcome = "transfer_error"
+				}
 				for _, attempt := range activeAttempts {
 					if attempt.keyIndex == selected.keyIndex {
 						attempt.cancel(errors.New("winner response completed"))
@@ -510,7 +588,7 @@ func (s *proxyServer) handleProxy(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 				cancelWave(errors.New("wave completed"))
-				log.Printf("request=%d method=%s path=%s status=%d winner_slot=%d duration_ms=%d", requestID, r.Method, r.URL.Path, selected.status, selected.keyIndex, time.Since(started).Milliseconds())
+				log.Printf("request=%d method=%s path=%s status=%d outcome=%s winner_slot=%d duration_ms=%d", requestID, r.Method, r.URL.Path, selected.status, outcome, selected.keyIndex, time.Since(started).Milliseconds())
 				return
 			case failure := <-failures:
 				failed++
@@ -581,7 +659,7 @@ func (s *proxyServer) runAttempt(ctx context.Context, inbound *http.Request, bod
 	}
 
 	if streaming {
-		prefix, reader, err := readValidSSEPrefix(response.Body)
+		prefix, reader, err := readValidSSEPrefix(response.Body, strings.HasSuffix(inbound.URL.Path, "/chat/completions"))
 		if err != nil {
 			_ = response.Body.Close()
 			failure := &upstreamFailure{
@@ -641,46 +719,6 @@ func (s *proxyServer) runAttempt(ctx context.Context, inbound *http.Request, bod
 		header:   response.Header.Clone(),
 		buffered: reply,
 	}}
-}
-
-func readValidSSEPrefix(body io.Reader) ([]byte, *bufio.Reader, error) {
-	reader := bufio.NewReader(body)
-	prefix := make([]byte, 0, 4096)
-	errorEvent := false
-	for len(prefix) < maxSSEPrefixBytes {
-		line, err := reader.ReadBytes('\n')
-		prefix = append(prefix, line...)
-		trimmed := bytes.TrimSpace(line)
-		switch {
-		case len(trimmed) == 0:
-			errorEvent = false
-		case bytes.HasPrefix(trimmed, []byte(":")):
-		case bytes.HasPrefix(trimmed, []byte("event:")):
-			eventName := strings.TrimSpace(string(bytes.TrimPrefix(trimmed, []byte("event:"))))
-			errorEvent = strings.EqualFold(eventName, "error")
-		case bytes.HasPrefix(trimmed, []byte("data:")):
-			payload := bytes.TrimSpace(bytes.TrimPrefix(trimmed, []byte("data:")))
-			if len(payload) > 0 && !bytes.Equal(payload, []byte("[DONE]")) {
-				if payloadErr, exists := structuredPayloadError(payload, true); exists {
-					return prefix, nil, payloadErr
-				}
-				var decoded map[string]json.RawMessage
-				if json.Unmarshal(payload, &decoded) == nil {
-					if errorEvent {
-						return prefix, nil, &upstreamPayloadError{}
-					}
-					return prefix, reader, nil
-				}
-			}
-		}
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return nil, nil, errors.New("upstream stream ended before a valid data event")
-			}
-			return nil, nil, err
-		}
-	}
-	return nil, nil, errors.New("upstream stream prefix exceeded validation limit")
 }
 
 func validateJSONReply(reply []byte) error {
@@ -787,18 +825,33 @@ func (s *proxyServer) applyFailurePolicy(failure *upstreamFailure) {
 	}
 }
 
-func (s *proxyServer) writeCandidate(w http.ResponseWriter, selected *candidate) {
+func (s *proxyServer) writeCandidate(w http.ResponseWriter, selected *candidate) error {
 	defer selected.close()
 	copyResponseHeaders(w.Header(), selected.header)
 	w.WriteHeader(selected.status)
 	if len(selected.buffered) > 0 {
-		_, _ = w.Write(selected.buffered)
-		return
+		_, err := w.Write(selected.buffered)
+		return err
 	}
-	if flusher, ok := w.(http.Flusher); ok {
-		flusher.Flush()
+	controller := http.NewResponseController(w)
+	buffer := make([]byte, 32<<10)
+	for {
+		n, readErr := selected.reader.Read(buffer)
+		if n > 0 {
+			if _, err := w.Write(buffer[:n]); err != nil {
+				return err
+			}
+			if err := controller.Flush(); err != nil {
+				return err
+			}
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				return nil
+			}
+			return readErr
+		}
 	}
-	_, _ = io.CopyBuffer(w, selected.reader, make([]byte, 32<<10))
 }
 
 func (s *proxyServer) writeFailure(w http.ResponseWriter, failure *upstreamFailure) {

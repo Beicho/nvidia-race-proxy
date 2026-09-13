@@ -1,5 +1,6 @@
 nvidia-race-proxy-*
 *.key
+*.keys
 keys*.txt
 .env
 .env.*

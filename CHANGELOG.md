@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.2.0 - 2026-09-13
+
+- Keep winning stream keys reserved until response cleanup, including client cancellation and live key removal.
+- Flush SSE chunks incrementally and distinguish transfer failures from completed responses.
+- Race on meaningful chat output instead of role-only events; handle bounded, complete multiline SSE events.
+- Reload keys on SIGHUP with atomic validation and preserved health/reservations; drain HTTP requests during shutdown.
+- Add an internal JSON metrics endpoint with bounded per-model latency histograms, request outcomes, 429 counts and loser cancellation latency.
+- Add real HTTP streaming, cancellation, reload concurrency, SSE validation and metrics regression coverage.
+
 ## v1.1.0 - 2026-08-30
 
 - Keep the existing three-key race while preventing reuse of keys that are still in flight.
